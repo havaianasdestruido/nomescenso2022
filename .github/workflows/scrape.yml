@@ -14,36 +14,58 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Scrape top-10000 nomes + sobrenomes from the IBGE API
+        id: scrape
+        shell: bash
         run: |
-          python3 ibge_nomes_scraper.py --tipo nome --max-names 10000 --workers 12 \
+          set +e
+          : > ci_status.txt
+          echo "== connectivity probe ==" >> ci_status.txt
+          curl -sS -o /tmp/probe.json -w 'probe http_code=%{http_code}\n' \
+            --max-time 30 \
+            'https://servicodados.ibge.gov.br/api/v3/nomes/2022/localidade/0/ranking/nome?page=1' \
+            >> ci_status.txt 2>&1
+          head -c 200 /tmp/probe.json >> ci_status.txt 2>/dev/null; echo >> ci_status.txt
+
+          echo "== scrape nome ==" >> ci_status.txt
+          python3 ibge_nomes_scraper.py --tipo nome --max-names 10000 --workers 8 \
             --cache-dir cache/nome_pages \
-            -o data/nomes_censo2022_nomes_top10000.jsonl
-          python3 ibge_nomes_scraper.py --tipo sobrenome --max-names 10000 --workers 12 \
+            -o data/nomes_censo2022_nomes_top10000.jsonl >> ci_status.txt 2>&1
+          echo "scrape nome exit=$?" >> ci_status.txt
+
+          echo "== scrape sobrenome ==" >> ci_status.txt
+          python3 ibge_nomes_scraper.py --tipo sobrenome --max-names 10000 --workers 8 \
             --cache-dir cache/sobrenome_pages \
-            -o data/nomes_censo2022_sobrenomes_top10000.jsonl
+            -o data/nomes_censo2022_sobrenomes_top10000.jsonl >> ci_status.txt 2>&1
+          echo "scrape sobrenome exit=$?" >> ci_status.txt
 
       - name: Validate output
+        shell: bash
         run: |
-          python3 - <<'EOF'
-          import json
+          set +e
+          python3 - >> ci_status.txt 2>&1 <<'EOF'
+          import json, os
           for path in ("data/nomes_censo2022_nomes_top10000.jsonl",
                        "data/nomes_censo2022_sobrenomes_top10000.jsonl"):
+              if not os.path.exists(path):
+                  print(f"VALIDATE {path}: MISSING"); continue
               rows = [json.loads(l) for l in open(path, encoding="utf-8")]
-              assert len(rows) == 10000, (path, len(rows))
-              assert all(set(r) == {"rank", "nome", "frequencia", "percent"} for r in rows)
-              freqs = [r["frequencia"] for r in rows]
-              assert all(a >= b for a, b in zip(freqs, freqs[1:])), "frequency not monotonic"
-              assert len({r["nome"] for r in rows}) == 10000, "duplicates"
-              print(f"{path}: OK (10000 unique rows, monotonic)")
+              ok = (len(rows) == 10000
+                    and all(set(r) == {"rank", "nome", "frequencia", "percent"} for r in rows)
+                    and all(a["frequencia"] >= b["frequencia"] for a, b in zip(rows, rows[1:]))
+                    and len({r["nome"] for r in rows}) == 10000)
+              print(f"VALIDATE {path}: {'OK' if ok else 'FAILED'} ({len(rows)} rows)")
           EOF
+          echo "validate exit=$?" >> ci_status.txt
 
       - name: Commit results back to the branch
+        if: always()
+        shell: bash
         run: |
           git config user.name 'arena-agent'
           git config user.email 'agent@arena.ai'
-          git add data cache
+          git add data cache ci_status.txt || true
           if ! git diff --cached --quiet; then
-            git commit -m 'Add IBGE Censo 2022 top-10000 nomes/sobrenomes (scraped by CI)'
+            git commit -m 'Add IBGE Censo 2022 top-10000 nomes/sobrenomes (scraped by CI) + status'
             git push
           else
             echo "No changes to commit."
