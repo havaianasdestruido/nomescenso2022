@@ -1,0 +1,50 @@
+name: Scrape IBGE nomes
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scrape top-10000 nomes + sobrenomes from the IBGE API
+        run: |
+          python3 ibge_nomes_scraper.py --tipo nome --max-names 10000 --workers 12 \
+            --cache-dir cache/nome_pages \
+            -o data/nomes_censo2022_nomes_top10000.jsonl
+          python3 ibge_nomes_scraper.py --tipo sobrenome --max-names 10000 --workers 12 \
+            --cache-dir cache/sobrenome_pages \
+            -o data/nomes_censo2022_sobrenomes_top10000.jsonl
+
+      - name: Validate output
+        run: |
+          python3 - <<'EOF'
+          import json
+          for path in ("data/nomes_censo2022_nomes_top10000.jsonl",
+                       "data/nomes_censo2022_sobrenomes_top10000.jsonl"):
+              rows = [json.loads(l) for l in open(path, encoding="utf-8")]
+              assert len(rows) == 10000, (path, len(rows))
+              assert all(set(r) == {"rank", "nome", "frequencia", "percent"} for r in rows)
+              freqs = [r["frequencia"] for r in rows]
+              assert all(a >= b for a, b in zip(freqs, freqs[1:])), "frequency not monotonic"
+              assert len({r["nome"] for r in rows}) == 10000, "duplicates"
+              print(f"{path}: OK (10000 unique rows, monotonic)")
+          EOF
+
+      - name: Commit results back to the branch
+        run: |
+          git config user.name 'arena-agent'
+          git config user.email 'agent@arena.ai'
+          git add data cache
+          if ! git diff --cached --quiet; then
+            git commit -m 'Add IBGE Censo 2022 top-10000 nomes/sobrenomes (scraped by CI)'
+            git push
+          else
+            echo "No changes to commit."
+          fi
