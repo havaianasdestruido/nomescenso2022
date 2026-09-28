@@ -32,6 +32,13 @@ Modes
    (JSON or Markdown-wrapped JSON) from a directory and merges them with the
    exact same parsing path used by live mode. Handy in network-restricted
    environments.
+3. SQLite: with --from-sqlite it reads a SQLite dump of the API (schema:
+   table "frequencias" with columns id_local, nome, tipo_nome, ano,
+   frequencia — see e.g. github.com/alexsantee/nomes_do_brasil_2022) and
+   rebuilds the full ranking. This reproduces the API ordering exactly:
+   frequency DESC, name DESC on ties (verified against the live API), with
+   competition ranking (ties share a rank, the next rank skips) and
+   percent = round(frequencia / population * 100, 4).
 
 Only the Python standard library is required.
 """
@@ -42,6 +49,7 @@ import argparse
 import concurrent.futures as cf
 import json
 import re
+import sqlite3
 import sys
 import time
 import urllib.error
@@ -54,6 +62,7 @@ API_URL = (
 )
 USER_AGENT = "ibge-nomes-scraper/1.0 (research; contact: see repo)"
 PAGE_SIZE = 30  # fixed server-side; kept for documentation/validation
+POP_BR_2022 = 203_080_756  # Censo 2022 resident population of Brazil
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
@@ -186,6 +195,44 @@ def crawl_from_cache(args) -> list[dict]:
     return pages_to_records(pages, args.max_names)
 
 
+def crawl_from_sqlite(args) -> list[dict]:
+    """Rebuild the full ranking from a SQLite dump of the IBGE API."""
+    db = Path(args.from_sqlite)
+    if not db.is_file():
+        raise SystemExit(f"sqlite file not found: {db}")
+    con = sqlite3.connect(db)
+    cur = con.cursor()
+    localidade = int(args.localidade) if str(args.localidade).isdigit() else args.localidade
+    censo = int(args.censo) if str(args.censo).isdigit() else args.censo
+    rows = cur.execute(
+        "SELECT nome, frequencia FROM frequencias "
+        "WHERE id_local = ? AND ano = ? AND tipo_nome = ? "
+        "ORDER BY frequencia DESC, nome DESC",
+        (localidade, censo, args.tipo),
+    ).fetchall()
+    con.close()
+    if not rows:
+        raise SystemExit("no rows matched (check --localidade/--censo/--tipo)")
+    population = args.population or POP_BR_2022
+    print(f"[sqlite] {len(rows)} rows from {db} (localidade={args.localidade}, "
+          f"ano={args.censo}, tipo={args.tipo})", file=sys.stderr)
+
+    records: list[dict] = []
+    rank = prev_freq = 0
+    for i, (nome, freq) in enumerate(rows):
+        if freq != prev_freq:
+            rank, prev_freq = i + 1, freq
+        records.append({
+            "rank": rank,
+            "nome": nome,
+            "frequencia": freq,
+            "percent": round(freq / population * 100, 4),
+        })
+    if args.max_names:
+        records = records[:args.max_names]
+    return records
+
+
 def pages_to_records(pages: dict[int, dict], max_names: int | None) -> list[dict]:
     records: list[dict] = []
     for page_no in sorted(pages):
@@ -220,6 +267,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="write/read raw API pages to/from this directory")
     ap.add_argument("--from-cache", action="store_true",
                     help="offline mode: parse --cache-dir files instead of HTTP")
+    ap.add_argument("--from-sqlite", default=None, metavar="DB",
+                    help="offline mode: rebuild the ranking from a SQLite dump "
+                         "with a 'frequencias' table instead of HTTP")
+    ap.add_argument("--population", type=int, default=None,
+                    help=f"population used for percent in --from-sqlite mode "
+                         f"(default: {POP_BR_2022}, Brasil Censo 2022)")
     ap.add_argument("-o", "--output", default=None,
                     help="output JSONL path (default: "
                          "nomes_censo2022_<tipo>[_topN].jsonl)")
@@ -227,8 +280,15 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.from_cache and not args.cache_dir:
         ap.error("--from-cache requires --cache-dir")
+    if args.from_cache and args.from_sqlite:
+        ap.error("--from-cache and --from-sqlite are mutually exclusive")
 
-    records = crawl_from_cache(args) if args.from_cache else crawl_live(args)
+    if args.from_sqlite:
+        records = crawl_from_sqlite(args)
+    elif args.from_cache:
+        records = crawl_from_cache(args)
+    else:
+        records = crawl_live(args)
 
     out = args.output
     if not out:
