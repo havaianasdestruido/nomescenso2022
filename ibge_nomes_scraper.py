@@ -141,36 +141,98 @@ def crawl_live(args) -> list[dict]:
           f"fetching {needed_pages} pages ({needed_pages * PAGE_SIZE} slots)",
           file=sys.stderr)
 
-    if args.cache_dir:
-        cache_dir = Path(args.cache_dir)
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    if cache_dir:
         cache_dir.mkdir(parents=True, exist_ok=True)
-        _write_cache(cache_dir, 1, meta)
+
+    def load_cached(page_no: int) -> dict | None:
+        """Return a valid cached page, or None if missing/unreadable."""
+        if not cache_dir:
+            return None
+        fp = _cache_path(cache_dir, args, page_no)
+        if not fp.is_file():
+            return None
+        try:
+            data = extract_json(fp.read_text(encoding="utf-8"))
+            if int(data.get("page", -1)) == page_no and isinstance(data.get("items"), list):
+                return data
+        except (ValueError, OSError):
+            pass
+        return None
 
     def worker(page_no: int):
-        url = API_URL.format(censo=args.censo, localidade=args.localidade,
-                             tipo=args.tipo, page=page_no)
-        data = extract_json(fetch_page_live(url).decode("utf-8"))
-        if args.cache_dir:
-            _write_cache(Path(args.cache_dir), page_no, data)
+        data = load_cached(page_no)
+        if data is None:  # missing or invalid cache entry -> fetch
+            url = API_URL.format(censo=args.censo, localidade=args.localidade,
+                                 tipo=args.tipo, page=page_no)
+            data = extract_json(fetch_page_live(url).decode("utf-8"))
+            if cache_dir:
+                _write_cache(cache_dir, args, page_no, data)
         return page_no, data
 
     pages: dict[int, dict] = {1: meta}
-    pending = [p for p in range(2, needed_pages + 1)]
-    done = 1
+    pending: list[int] = []
+    reused = 0
+    for p in range(2, needed_pages + 1):
+        cached = load_cached(p)
+        if cached is not None:
+            pages[p] = cached
+            reused += 1
+        else:
+            pending.append(p)
+    if cache_dir:
+        _write_cache(cache_dir, args, 1, meta)
+    if reused:
+        print(f"[live] reusing {reused} valid cached page(s) "
+              f"from {cache_dir}", file=sys.stderr)
+
+    done = reused + 1  # page 1 (meta) plus the reused cached pages
+    max_in_flight = max(args.workers * 2, 1)
     with cf.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {pool.submit(worker, p): p for p in pending}
-        for fut in cf.as_completed(futures):
-            page_no, data = fut.result()
-            pages[page_no] = data
-            done += 1
-            if done % 50 == 0 or done == len(pages):
-                print(f"[live] {done}/{needed_pages} pages", file=sys.stderr)
+        futures: dict[cf.Future, int] = {}
+        it = iter(pending)
+        try:
+            for _ in range(max_in_flight):
+                p = next(it, None)
+                if p is None:
+                    break
+                futures[pool.submit(worker, p)] = p
+            while futures:
+                batch_done = cf.wait(futures, return_when=cf.FIRST_COMPLETED)
+                for fut in batch_done.done:
+                    futures.pop(fut)
+                    page_no, data = fut.result()  # raises -> finally cancels the rest
+                    pages[page_no] = data
+                    done += 1
+                    if done % 50 == 0 or done == needed_pages:
+                        print(f"[live] {done}/{needed_pages} pages", file=sys.stderr)
+                    nxt = next(it, None)
+                    if nxt is not None:
+                        futures[pool.submit(worker, nxt)] = nxt
+        finally:
+            for fut in futures:
+                fut.cancel()
+            pool.shutdown(wait=True, cancel_futures=True)
 
     return pages_to_records(pages, args.max_names)
 
 
-def _write_cache(cache_dir: Path, page_no: int, data: dict) -> None:
-    (cache_dir / f"page-{page_no:05d}.json").write_text(
+def _cache_prefix(args) -> str:
+    """Filename prefix identifying a request (censo/localidade/tipo), so
+    different requests sharing one --cache-dir cannot clobber each other."""
+    return f"censo-{args.censo}_localidade-{args.localidade}_tipo-{args.tipo}"
+
+
+def _cache_path(cache_dir: Path, args, page_no: int) -> Path:
+    return cache_dir / f"{_cache_prefix(args)}_page-{page_no:05d}.json"
+
+
+def _cache_glob(args) -> str:
+    return f"{_cache_prefix(args)}_page-*.json"
+
+
+def _write_cache(cache_dir: Path, args, page_no: int, data: dict) -> None:
+    _cache_path(cache_dir, args, page_no).write_text(
         json.dumps(data, ensure_ascii=False, separators=(",", ":")),
         encoding="utf-8",
     )
@@ -183,15 +245,51 @@ def crawl_from_cache(args) -> list[dict]:
     cache_dir = Path(args.cache_dir)
     if not cache_dir.is_dir():
         raise SystemExit(f"cache dir not found: {cache_dir}")
-    files = sorted(p for p in cache_dir.glob("page-*.json"))
+    pattern = _cache_glob(args)
+    files = sorted(cache_dir.glob(pattern))
     if not files:
-        raise SystemExit(f"no page-*.json files in {cache_dir}")
+        raise SystemExit(f"no {pattern} files in {cache_dir} "
+                         f"(censo={args.censo} localidade={args.localidade} "
+                         f"tipo={args.tipo})")
     pages: dict[int, dict] = {}
     for fp in files:
-        data = extract_json(fp.read_text(encoding="utf-8"))
-        pages[int(data.get("page", fp.stem.split("-")[1]))] = data
+        try:
+            data = extract_json(fp.read_text(encoding="utf-8"))
+        except (ValueError, OSError) as exc:
+            raise SystemExit(f"invalid cached page {fp.name}: {exc}")
+        pages[int(data.get("page", fp.stem.rsplit("-", 1)[1]))] = data
     print(f"[cache] loaded {len(pages)} cached pages from {cache_dir}",
           file=sys.stderr)
+
+    # Validate that the cache is contiguous and complete for this request.
+    # A shorter cache is accepted only when --max-names explicitly limits
+    # the requested output (or --max-pages caps the crawl).
+    total_pages_list = {int(d["totalPages"]) for d in pages.values()
+                        if "totalPages" in d}
+    if len(total_pages_list) > 1:
+        raise SystemExit(f"cached pages disagree on totalPages: {total_pages_list}")
+    if not total_pages_list:
+        raise SystemExit("cached pages carry no totalPages metadata")
+    total_pages = total_pages_list.pop()
+    required = total_pages
+    if args.max_names:
+        required = min(required, -(-args.max_names // PAGE_SIZE))
+    if args.max_pages:
+        required = min(required, args.max_pages)
+    missing = [p for p in range(1, required + 1) if p not in pages]
+    if missing:
+        shown = ", ".join(str(p) for p in missing[:20])
+        more = f" (+{len(missing) - 20} more)" if len(missing) > 20 else ""
+        limit_note = (" (cache covers more than the --max-names/--max-pages "
+                      "limit, which is fine)" if required < total_pages else
+                      "; pass --max-names N to accept a cache covering only "
+                      "the top N names")
+        raise SystemExit(
+            f"cache is incomplete for censo={args.censo} "
+            f"localidade={args.localidade} tipo={args.tipo}: missing pages "
+            f"{shown}{more} of 1..{required} (totalPages={total_pages})"
+            f"{limit_note}")
+
     return pages_to_records(pages, args.max_names)
 
 
@@ -274,8 +372,9 @@ def main(argv: list[str] | None = None) -> int:
                     help=f"population used for percent in --from-sqlite mode "
                          f"(default: {POP_BR_2022}, Brasil Censo 2022)")
     ap.add_argument("-o", "--output", default=None,
-                    help="output JSONL path (default: "
-                         "nomes_censo2022_<tipo>[_topN].jsonl)")
+                    help="output JSONL path (default: nomes_censo2022_<tipo>"
+                         "[_censo-C][_localidade-L][_topN].jsonl, where the "
+                         "censo/localidade parts appear only if non-default)")
     args = ap.parse_args(argv)
 
     if args.from_cache and not args.cache_dir:
@@ -293,7 +392,12 @@ def main(argv: list[str] | None = None) -> int:
     out = args.output
     if not out:
         suffix = f"_top{args.max_names}" if args.max_names else ""
-        out = f"nomes_censo2022_{args.tipo}{suffix}.jsonl"
+        scope = ""
+        if args.censo != "2022":
+            scope += f"_censo-{args.censo}"
+        if args.localidade != "0":
+            scope += f"_localidade-{args.localidade}"
+        out = f"nomes_censo2022_{args.tipo}{scope}{suffix}.jsonl"
     with open(out, "w", encoding="utf-8") as fh:
         for rec in records:
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
